@@ -1284,10 +1284,27 @@ file."
 
 ;;; Tool use
 
-(defcustom gptel-use-tools t
-  "Whether gptel should use tools."
-  :group 'gptel
-  :type 'boolean)
+(defcustom gptel-use-tools 'auto
+  "Whether gptel should use tools.
+
+Tools are capabilities provided by you to the LLM as functions an
+LLM can choose to call.  gptel runs the function call on your
+machine.
+
+If set to the symbol auto, any tools selected in `gptel-tools'
+will be made available to the LLM.  This is the default.  It has
+no effect if no tools are available or selected.
+
+If set to t, gptel will try to force the LLM to call one or more
+of the provided tools.  Support for this feature depends on the
+backend/API, and gptel will fall back to the default behavior
+when forcing tool use is unsupported.
+
+If nil, tool use is turned off."
+  :type '(choice
+          (const :tag "When available" auto)
+          (const :tag "Force tool use" t)
+          (const :tag "Off" nil)))
 
 (defcustom gptel-tools nil
   "A list of tools to include with gptel requests.
