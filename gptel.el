@@ -166,6 +166,7 @@
 
 (declare-function ediff-make-cloned-buffer "ediff-util")
 (declare-function ediff-regions-internal "ediff")
+(declare-function hl-line-highlight "hl-line")
 
 (declare-function gptel-org--create-prompt "gptel-org")
 (declare-function gptel-org-set-topic "gptel-org")
@@ -2229,10 +2230,11 @@ See `gptel--url-get-response' for details."
   (let* ((gptel-buffer (plist-get info :buffer))
          (start-marker (plist-get info :position))
          (tracking-marker (plist-get info :tracking-marker)))
-    (when (stringp response)
+    (cond
+     ((stringp response)                ;Response text
       (with-current-buffer gptel-buffer
         (when-let* ((transformer (plist-get info :transformer)))
-              (setq response (funcall transformer response)))
+          (setq response (funcall transformer response)))
         (when tracking-marker           ;separate from previous response
           (setq response (concat "\n\n" response)))
         (save-excursion
@@ -2250,7 +2252,9 @@ See `gptel--url-get-response' for details."
             (insert response)
             (plist-put info :tracking-marker (setq tracking-marker (point-marker)))
             ;; for uniformity with streaming responses
-            (set-marker-insertion-type tracking-marker t)))))))
+            (set-marker-insertion-type tracking-marker t)))))
+     ((listp response)                  ;tool call or tool result?
+      (gptel--display-tool-calls response info)))))
 
 (defun gptel--create-prompt (&optional prompt-end)
   "Return a full conversation prompt from the contents of this buffer.
@@ -2589,6 +2593,134 @@ INTERACTIVEP is t when gptel is called interactively."
       (message "Send your query with %s!"
                (substitute-command-keys "\\[gptel-send]")))
     (current-buffer)))
+
+
+;;; Tool use UI
+(defun gptel--display-tool-calls (response info)
+  (let* ((start-marker (plist-get info :position))
+         ;; FIXME(tool) use a wrapper instead of a manual text-property search,
+         ;; this is fragile
+         (ov-start (save-excursion
+                     (goto-char start-marker)
+                     (text-property-search-backward 'gptel 'response)
+                     (point)))
+         (tracking-marker (plist-get info :tracking-marker)))
+    (if (cl-typep (caar response) 'gptel-tool) ;tool calls
+        ;; pending tool calls look like ((name . (tool callback args)) ...)
+        (with-current-buffer (plist-get info :buffer)
+          (let* ((backend-name (gptel-backend-name (plist-get info :backend)))
+                 (actions-string
+                  (concat (propertize "Run tools: " 'face 'font-lock-string-face)
+                          (propertize "C-c C-c" 'face 'help-key-binding)
+                          (propertize ", Cancel request: " 'face 'font-lock-string-face)
+                          (propertize "C-c C-k" 'face 'help-key-binding)
+                          (propertize ", Inspect: " 'face 'font-lock-string-face)
+                          (propertize "C-c C-i" 'face 'help-key-binding)))
+                 (confirm-strings
+                  (list (concat "\n" actions-string
+                                (propertize "\n" 'face '(:inherit font-lock-string-face
+                                                         :underline t :extend t))
+                                (format (propertize "\n%s wants to run:\n"
+                                                    'face 'font-lock-string-face)
+                                        backend-name))))
+                 (ov (or (cdr-safe (get-char-property-and-overlay
+                                    start-marker 'gptel-tool))
+                         (make-overlay ov-start (or tracking-marker start-marker)))))
+            (pcase-dolist (`(,tool-spec _ ,arg-values) response)
+              (push (format "(%s %s)\n"
+                            (propertize (gptel-tool-name tool-spec) 'face 'font-lock-keyword-face)
+                            (propertize
+                             (mapconcat
+                              (lambda (arg)
+                                (cond ((stringp arg)
+                                       (prin1-to-string
+                                        (replace-regexp-in-string
+                                         "\n" "⮐" (truncate-string-to-width
+                                                   arg (floor (window-width) 4)
+                                                   nil nil t))))
+                                      (t (prin1-to-string arg))))
+                              arg-values " ")
+                             'face 'font-lock-constant-face))
+                    confirm-strings))
+            (push (concat (propertize "\n" 'face '(:inherit font-lock-string-face
+                                                   :underline t :extend t)))
+                  confirm-strings)
+            ;; Add confirmation prompt to the overlay
+            (overlay-put ov 'after-string
+                         (apply #'concat (nreverse confirm-strings)))
+            (overlay-put ov 'mouse-face 'highlight)
+            (overlay-put ov 'gptel-tool response)
+            (overlay-put ov 'help-echo
+                         (concat "Tool call(s) requested: " actions-string))
+            (overlay-put ov 'keymap
+                         (define-keymap
+                           "<mouse-1>" #'gptel--dispatch-tool-calls
+                           "C-c C-c" #'gptel--accept-tool-calls
+                           "C-c C-k" #'gptel--reject-tool-calls
+                           "C-c C-i" (lambda () (interactive)
+                                       (with-selected-window
+                                           (gptel--inspect-fsm gptel--fsm-last)
+                                         (goto-char (point-min))
+                                         (when (search-forward-regexp "^:tool-use")
+                                           (forward-line 0)
+                                           (hl-line-highlight))))))))
+      ;; finished tool call results look like ((name . result) ...)
+      ;; Insert tool results
+      (when gptel-include-tool-results
+        (with-current-buffer (marker-buffer start-marker)
+          (cl-loop
+           for (name . result) in response
+           with include-names =
+           (mapcar #'gptel-tool-name
+                   (cl-remove-if-not #'gptel-tool-include (plist-get info :tools)))
+           if (or (eq gptel-include-tool-results t) (member name include-names))
+           do (funcall (plist-get info :callback)
+                       (if (derived-mode-p 'org-mode)
+                           (concat "\n:TOOL_CALL:\n" name "\n" result "\n:END:\n")
+                         (concat "\n```\n" name "\n" result "\n```"))
+                       info)
+           (when (derived-mode-p 'org-mode) ;fold drawer
+             (ignore-errors
+               (save-excursion
+                 (goto-char (plist-get info :tracking-marker))
+                 (forward-line -1) ;org-fold-hide-drawer-toggle requires Emacs 29.1
+                 (when (looking-at "^:END:") (org-cycle)))))))))))
+
+(defun gptel--accept-tool-calls (&optional response ov)
+  (interactive (pcase-let ((`(,resp . ,o) (get-char-property-and-overlay
+                                           (point) 'gptel-tool)))
+                 (list resp o)))
+  (gptel--update-status " Calling tool..." 'mode-line-emphasis)
+  (message "Continuing query...")
+  (cl-loop for (tool-spec process-tool-result arg-values) in response
+           do
+           (if (gptel-tool-async tool-spec)
+               (apply (gptel-tool-function tool-spec)
+                      process-tool-result arg-values)
+             (let ((result
+                    (condition-case-unless-debug errdata
+                        (apply (gptel-tool-function tool-spec) arg-values)
+                      (error (mapconcat #'gptel--to-string errdata " ")))))
+               (funcall process-tool-result result))))
+  (delete-overlay ov))
+
+(defun gptel--reject-tool-calls (&optional _response ov)
+  (interactive (pcase-let ((`(,resp . ,o) (get-char-property-and-overlay
+                                           (point) 'gptel-tool)))
+                 (list resp o)))
+  (gptel--update-status " Tools cancelled" 'error)
+  (delete-overlay ov))
+
+(defun gptel--dispatch-tool-calls (choice)
+  (interactive
+   (list
+    (let ((choices '((?y "yes") (?n "do nothing")
+                     (?k "abort request") (?i "inspect call(s)"))))
+      (read-multiple-choice "Run tool calls? " choices))))
+  (pcase (car choice)
+    (?y (call-interactively #'gptel--accept-tool-calls))
+    (?k (call-interactively #'gptel--reject-tool-calls))
+    (?i (gptel--inspect-fsm gptel--fsm-last))))
 
 
 ;;; Response tweaking commands
