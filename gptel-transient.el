@@ -641,7 +641,26 @@ Using the scope option, you can set tools to use with gptel
 requests globally, in this buffer or for the next request
 only (\"oneshot\")."
   [:description "Provide the LLM with tools to run tasks for you"
-   [(gptel--infix-variable-scope)]]
+   [""
+    (gptel--infix-variable-scope)
+    (gptel--infix-use-tools)
+    (gptel--infix-confirm-tool-calls)
+    (gptel--infix-include-tool-results)]
+   [""
+    ("RET" "Confirm selection"
+     (lambda (args)
+       (interactive (list (transient-args transient-current-command)))
+       ;; There are two kinds of ARGS: categories with value "(*)", and lists of
+       ;; the type '("category" "tool_name").  We only want the latter, to use an
+       ;; index into `gptel--known-backends.'
+       (gptel--set-with-scope
+        'gptel-tools
+        (mapcar (lambda (category-and-name)
+                  (map-nested-elt gptel--known-tools category-and-name))
+                (cl-delete-if-not #'consp args))
+        gptel--set-buffer-locally))
+     :transient transient--do-return)
+    ("q" "Cancel" transient-quit-one)]]
   [:class transient-column
    :setup-children
    (lambda (_)
@@ -686,21 +705,7 @@ only (\"oneshot\")."
                                  :format " %k %d %v"
                                  :class 'gptel--switch-category
                                  :category category))
-                 infixes-for-category)))))))]
-  [[("RET" "Confirm tools"
-     (lambda (args)
-       (interactive (list (transient-args transient-current-command)))
-       ;; There are two kinds of ARGS: categories with value "(*)", and lists of
-       ;; the type '("category" "tool_name").  We only want the latter, to use an
-       ;; index into `gptel--known-backends.'
-       (gptel--set-with-scope
-        'gptel-tools
-        (mapcar (lambda (category-and-name)
-                  (map-nested-elt gptel--known-tools category-and-name))
-                (cl-delete-if-not #'consp args))
-        gptel--set-buffer-locally))
-     :transient transient--do-return)]
-   [("q" "Cancel" transient-quit-one)]])
+                 infixes-for-category)))))))])
 
 
 ;; * Transient Infixes
@@ -987,6 +992,48 @@ Or in an extended conversation:
                    (pref (completing-read prompt choices nil t)))
               (cdr (assoc pref choices))))
   :key "-t")
+
+(transient-define-infix gptel--infix-confirm-tool-calls ()
+  "Whether tool calls should wait for the user to run them.
+
+This sets the variable `gptel-confirm-tool-calls', which see."
+  :key "-c"
+  :description "Confirm tool calls"
+  :class 'gptel-lisp-variable
+  :variable 'gptel-confirm-tool-calls
+  :set-value #'gptel--set-with-scope
+  :display-nil "never"
+  :display-map '((nil . "never")
+                 (t   . "always")
+                 (auto . "auto"))
+  :prompt "Tool calls require confirmation? "
+  :reader (lambda (prompt &rest _)
+            (let* ((choices '(("no"   . nil)
+                              ("always" . t)
+                              ("tool decides" . auto)))
+                   (pref (completing-read prompt choices nil t)))
+              (cdr (assoc pref choices)))))
+
+(transient-define-infix gptel--infix-include-tool-results ()
+  "Whether tool call results should be included in the buffer.
+
+This sets the variable `gptel-include-tool-results', which see."
+  :key "-i"
+  :description "Include results   "
+  :class 'gptel-lisp-variable
+  :variable 'gptel-include-tool-results
+  :set-value #'gptel--set-with-scope
+  :display-nil "never"
+  :display-map '((nil . "never")
+                 (t   . "always")
+                 (auto . "auto"))
+  :prompt "Include tool results in LLM response? "
+  :reader (lambda (prompt &rest _)
+            (let* ((choices '(("never"   . nil)
+                              ("always" . t)
+                              ("tool decides" . auto)))
+                   (pref (completing-read prompt choices nil t)))
+              (cdr (assoc pref choices)))))
 
 
 ;; * Transient Suffixes
