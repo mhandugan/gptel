@@ -1841,7 +1841,7 @@ Run post-response hooks."
         (gptel--update-status
          (format " Calling tool..." ) 'mode-line-emphasis)))
 
-    (let ((result-alist))
+    (let ((result-alist) (pending-calls))
       (mapc                             ; Construct function calls
        (lambda (tool-call)
          (letrec ((name (plist-get tool-call :name))
@@ -1873,15 +1873,27 @@ Run post-response hooks."
                                   (concat ":" (plist-get arg :name)))))
                         (plist-get args key)))
                     (gptel-tool-args tool-spec)))
-             (if (gptel-tool-async tool-spec)
-                 (apply (gptel-tool-function tool-spec)
-                        process-tool-result arg-values)
-               (let ((result
-                      (condition-case-unless-debug errdata
-                          (apply (gptel-tool-function tool-spec) arg-values)
-                        (error (mapconcat #'gptel--to-string errdata " ")))))
-                 (funcall process-tool-result result))))))
-       tool-use))))
+             ;; Check if tool requires confirmation
+             (if (and gptel-confirm-tool-calls (or (eq gptel-confirm-tool-calls t)
+                                                 (gptel-tool-confirm tool-spec)))
+                 (push (list tool-spec process-tool-result arg-values)
+                       pending-calls)
+               ;; If not, run the tool
+               (if (gptel-tool-async tool-spec)
+                   (apply (gptel-tool-function tool-spec)
+                          process-tool-result arg-values)
+                 (let ((result
+                        (condition-case-unless-debug errdata
+                            (apply (gptel-tool-function tool-spec) arg-values)
+                          (error (mapconcat #'gptel--to-string errdata " ")))))
+                   (funcall process-tool-result result)))))))
+       tool-use)
+      (when pending-calls
+        (with-current-buffer (plist-get info :buffer)
+          (setq gptel--fsm-last fsm)
+          (when gptel-mode (gptel--update-status
+                            (format " Run tools?" ) 'mode-line-emphasis)))
+        (funcall (plist-get info :callback) pending-calls info)))))
 
 ;;;; State machine predicates
 ;; Predicates used to find the next state to transition to, see
@@ -1930,7 +1942,7 @@ RESPONSE is
 - nil if there was no response or an error.
 - The symbol `abort' if the request was aborted, see
   `gptel-abort'.
-- An alist of called tools and tool results when the LLM runs a
+- An alist of tool names and tool results when the LLM runs a
   tool
 
 The INFO plist has (at least) the following keys:
